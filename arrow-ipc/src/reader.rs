@@ -915,6 +915,42 @@ fn update_dictionaries(
     Ok(())
 }
 
+/// Returns the first field in `fields`, in the order of [`Schema::fields_with_dict_id`],
+/// whose dictionary has `id`.
+///
+/// This stops at the first match and allocates nothing, so reading a stream with many
+/// dictionaries does not collect the whole schema once per dictionary batch.
+fn first_field_with_dict_id(fields: &Fields, id: i64) -> Option<&Field> {
+    fields
+        .iter()
+        .find_map(|field| field_with_dict_id(field, id))
+}
+
+fn field_with_dict_id(field: &Field, id: i64) -> Option<&Field> {
+    #[expect(deprecated)]
+    let dict_id = field.dict_id();
+    if dict_id == Some(id) {
+        return Some(field);
+    }
+    child_field_with_dict_id(field.data_type(), id)
+}
+
+fn child_field_with_dict_id(data_type: &DataType, id: i64) -> Option<&Field> {
+    match data_type {
+        DataType::Struct(fields) => first_field_with_dict_id(fields, id),
+        DataType::Union(fields, _) => fields.iter().find_map(|(_, f)| field_with_dict_id(f, id)),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _)
+        | DataType::RunEndEncoded(_, field) => field_with_dict_id(field, id),
+        DataType::Dictionary(_, value_type) => child_field_with_dict_id(value_type, id),
+        _ => None,
+    }
+}
+
 /// Given a dictionary batch IPC message/body along with the full state of a
 /// stream including schema, dictionary cache, metadata, and other flags, this
 /// function will parse the buffer into an array of dictionary values.
@@ -928,9 +964,7 @@ fn get_dictionary_values(
     skip_validation: UnsafeFlag,
 ) -> Result<ArrayRef, ArrowError> {
     let id = batch.id();
-    #[expect(deprecated)]
-    let fields_using_this_dictionary = schema.fields_with_dict_id(id);
-    let first_field = fields_using_this_dictionary.first().ok_or_else(|| {
+    let first_field = first_field_with_dict_id(schema.fields(), id).ok_or_else(|| {
         ArrowError::InvalidArgumentError(format!("dictionary id {id} not found in schema"))
     })?;
 
@@ -3869,6 +3903,112 @@ mod tests {
         expect_ipc_validation_error(
             invalid_struct_arr,
             "Invalid argument error: Invalid UTF8 sequence at string index 3 (3..18): invalid utf-8 sequence of 1 bytes from index 11",
+        );
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_first_field_with_dict_id_matches_fields_with_dict_id() {
+        let dict = |name: &str, id: i64| {
+            let data_type =
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+            Arc::new(Field::new_dict(name, data_type, true, id, false))
+        };
+        let list_of = |field: Arc<Field>| DataType::List(field);
+        let schema = Schema::new(vec![
+            // A dict_id on a non-dictionary field never matches.
+            Field::new_dict("not_a_dictionary", DataType::Utf8, true, 3, false),
+            Field::new_struct(
+                "struct",
+                vec![dict("struct.a", 1), dict("struct.b", 2)],
+                true,
+            ),
+            Field::new(
+                "union",
+                DataType::Union(
+                    UnionFields::try_new(vec![0, 1], vec![dict("union.a", 3), dict("union.b", 1)])
+                        .unwrap(),
+                    UnionMode::Dense,
+                ),
+                true,
+            ),
+            Field::new("list", list_of(dict("list.item", 4)), true),
+            Field::new(
+                "large_list",
+                DataType::LargeList(dict("large_list.item", 5)),
+                true,
+            ),
+            Field::new(
+                "list_view",
+                DataType::ListView(dict("list_view.item", 6)),
+                true,
+            ),
+            Field::new(
+                "large_list_view",
+                DataType::LargeListView(dict("large_list_view.item", 7)),
+                true,
+            ),
+            Field::new(
+                "fixed_size_list",
+                DataType::FixedSizeList(dict("fixed_size_list.item", 8), 2),
+                true,
+            ),
+            Field::new_map(
+                "map",
+                "entries",
+                dict("map.key", 9),
+                dict("map.value", 2),
+                false,
+                true,
+            ),
+            Field::new(
+                "run_end_encoded",
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    dict("run_end_encoded.values", 10),
+                ),
+                true,
+            ),
+            Field::new_dict(
+                "dictionary_of_list_of_dictionary",
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(list_of(dict("inner", 12))),
+                ),
+                true,
+                11,
+                false,
+            ),
+            Field::new_struct(
+                "deep",
+                vec![Field::new_struct("deeper", vec![dict("deepest", 13)], true)],
+                true,
+            ),
+            Field::new(
+                "late_duplicate",
+                list_of(dict("late_duplicate.item", 1)),
+                true,
+            ),
+            Field::new_dict(
+                "outer_before_inner",
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(list_of(dict("outer_before_inner.inner", 14))),
+                ),
+                true,
+                14,
+                false,
+            ),
+        ]);
+
+        for id in -1..=15 {
+            let expected = schema.fields_with_dict_id(id).first().map(|f| f.name());
+            let actual = first_field_with_dict_id(schema.fields(), id).map(|f| f.name());
+            assert_eq!(actual, expected, "dictionary id {id}");
+        }
+        assert_eq!(
+            first_field_with_dict_id(schema.fields(), 1).map(|f| f.name().as_str()),
+            Some("struct.a")
         );
     }
 
