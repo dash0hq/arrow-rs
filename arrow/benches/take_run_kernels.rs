@@ -10,13 +10,17 @@
 //! Runs have length 1 or random lengths with mean 16 or 1,024; their values are `UInt8`
 //! or `Dictionary<Int32, Utf8>`.
 //!
-//! Next to `take`, two floor kernels measure lower bounds for the same case:
+//! Next to `take`, two reference baselines run on the same case. They are not lower bounds:
+//! each skips work that a `take` must do, and `take` can beat them.
 //!
-//! - `floor_stream` reads every index once and writes every output run once.
-//!   No `take` that reads its indices can be faster.
-//! - `floor_lookup` finds each index's value with one lookup in a precomputed
-//!   logical-to-physical map and run-encodes the output. A `take` that does
-//!   constant work per index cannot be much faster.
+//! - `baseline_stream` sums the indices once and copies the run ends and values of the
+//!   expected output. It does not find the run of any index, check bounds, handle null
+//!   indices or merge runs.
+//! - `baseline_lookup` looks up each index's value in a logical-to-physical table built
+//!   before timing, then run-encodes the values. It does not build the table, check bounds,
+//!   handle null indices (it reads their backing values) or take the output values, and it
+//!   allocates its output at the number of indices, so it can be slower than a `take` that
+//!   copies whole runs.
 
 use std::hint;
 use std::sync::Arc;
@@ -60,7 +64,7 @@ fn u8_values(runs: usize) -> UInt8Array {
 }
 
 /// `Dictionary<Int32, Utf8>` values, as in a string attribute column. The dictionary holds
-/// each string once, so the floors compare keys to compare values.
+/// each string once, so the baselines compare keys to compare values.
 fn dict_values(runs: usize) -> DictionaryArray<Int32Type> {
     let strings = StringArray::from_iter_values((0..64).map(|i| format!("attribute-value-{i}")));
     let keys = Int32Array::from_iter_values((0..runs).map(|i| (i % 64) as i32));
@@ -95,7 +99,7 @@ fn indices(rng: &mut StdRng, shape: &str) -> UInt32Array {
 }
 
 /// Reads every index once and writes the output runs.
-fn floor_stream<R: Copy, V: Copy>(
+fn baseline_stream<R: Copy, V: Copy>(
     indices: &[u32],
     out_ends: &[R],
     out_values: &[V],
@@ -110,7 +114,7 @@ fn floor_stream<R: Copy, V: Copy>(
 /// # Safety
 ///
 /// Every index must be in bounds for `physical`, and every physical index for `values`.
-unsafe fn floor_lookup<R: ArrowNativeType, V: Copy + PartialEq>(
+unsafe fn baseline_lookup<R: ArrowNativeType, V: Copy + PartialEq>(
     indices: &[u32],
     physical: &[u32],
     values: &[V],
@@ -140,7 +144,7 @@ unsafe fn floor_lookup<R: ArrowNativeType, V: Copy + PartialEq>(
     (out_ends, out_values)
 }
 
-/// Benchmarks `take` and its floors. `natives` returns the values a floor reads for an array
+/// Benchmarks `take` and its baselines. `natives` returns the values a baseline reads for an array
 /// of run values: the values of a primitive array, the keys of a dictionary.
 fn bench_case<R: RunEndIndexType, V: Copy + PartialEq>(
     c: &mut Criterion,
@@ -165,10 +169,10 @@ fn bench_case<R: RunEndIndexType, V: Copy + PartialEq>(
     c.bench_function(&format!("{name}/take"), |b| {
         b.iter(|| take(&array, indices, None).unwrap())
     });
-    c.bench_function(&format!("{name}/floor_stream"), |b| {
-        b.iter(|| floor_stream(hint::black_box(indices_values), &out_ends, &out_values))
+    c.bench_function(&format!("{name}/baseline_stream"), |b| {
+        b.iter(|| baseline_stream(hint::black_box(indices_values), &out_ends, &out_values))
     });
-    c.bench_function(&format!("{name}/floor_lookup"), |b| {
+    c.bench_function(&format!("{name}/baseline_lookup"), |b| {
         assert!(
             indices_values
                 .iter()
@@ -177,7 +181,11 @@ fn bench_case<R: RunEndIndexType, V: Copy + PartialEq>(
         assert!(physical.iter().all(|&p| (p as usize) < source_values.len()));
         // SAFETY: the asserts above bound every lookup.
         b.iter(|| unsafe {
-            floor_lookup::<R::Native, V>(hint::black_box(indices_values), &physical, &source_values)
+            baseline_lookup::<R::Native, V>(
+                hint::black_box(indices_values),
+                &physical,
+                &source_values,
+            )
         })
     });
 }
