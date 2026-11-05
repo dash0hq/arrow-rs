@@ -1458,6 +1458,13 @@ fn take_run<T: RunEndIndexType, I: ArrowPrimitiveType>(
                 .into(),
         ));
     }
+    let len = logical_indices.len();
+    if T::Native::from_usize(len).is_none() {
+        return Err(ArrowError::ComputeError(format!(
+            "Cannot take {len} rows into a RunEndEncoded array with {} run ends",
+            T::DATA_TYPE
+        )));
+    }
 
     let physical_indices = physical_indices_for_take(run_array, logical_indices)?;
 
@@ -4094,6 +4101,22 @@ mod tests {
 
         let actual = result.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(actual, vec!["bob", "bob", "bob", "bob"]);
+    }
+
+    #[test]
+    fn test_take_runs_overflowing_run_ends() {
+        let run_array =
+            RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1]), &Int32Array::from(vec![7]))
+                .unwrap();
+
+        let taken = take(&run_array, &UInt32Array::from(vec![0; 32_767]), None).unwrap();
+        assert_eq!(taken.as_run::<Int16Type>().run_ends().values(), &[32_767]);
+
+        let error = take(&run_array, &UInt32Array::from(vec![0; 32_768]), None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Compute error: Cannot take 32768 rows into a RunEndEncoded array with Int16 run ends"
+        );
     }
 
     #[test]
