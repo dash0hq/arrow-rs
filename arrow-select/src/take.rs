@@ -13,8 +13,8 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::*;
 use arrow_buffer::{
-    ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, NullBuffer, NullBufferBuilder,
-    OffsetBuffer, RunEndBuffer, ScalarBuffer, bit_util,
+    ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, RunEndBuffer,
+    ScalarBuffer, bit_util,
 };
 use arrow_cmp::make_comparator;
 use arrow_data::{ArrayData, transform::MutableArrayData};
@@ -1440,14 +1440,12 @@ fn take_dict<T: ArrowDictionaryKeyType, I: ArrowPrimitiveType, const VALIDATE_IN
 
 /// `take` implementation for run arrays
 ///
-/// Finds physical indices for the given logical indices and builds output run array
-/// by taking values in the input run_array.values at the physical indices.
-/// The output run array will be run encoded on the physical indices and not on output values.
-/// For e.g. an input `RunArray{ run_ends = [2,4,6,8], values=[1,2,1,2] }` and `logical_indices=[2,3,6,7]`
-/// would be converted to `physical_indices=[1,1,3,3]` which will be used to build
-/// output `RunArray{ run_ends=[2,4], values=[2,2] }`.
+/// Finds the runs that the logical indices select, merges neighbouring runs with equal
+/// values, and takes the values of the merged runs. For example, `logical_indices=[2,3,6,7]`
+/// select the physical runs `[1,3]` of `RunArray{ run_ends=[2,4,6,8], values=[1,2,1,2] }`,
+/// whose equal values `[2,2]` merge into `RunArray{ run_ends=[4], values=[2] }`.
 ///
-/// A null logical index becomes a null run. Consecutive nulls are merged.
+/// A null logical index becomes a null run. Neighbouring null runs merge.
 fn take_run<T: RunEndIndexType, I: ArrowPrimitiveType>(
     run_array: &RunArray<T>,
     logical_indices: &PrimitiveArray<I>,
@@ -1466,57 +1464,306 @@ fn take_run<T: RunEndIndexType, I: ArrowPrimitiveType>(
         )));
     }
 
-    let physical_indices = physical_indices_for_take(run_array, logical_indices)?;
-
-    // Run encode the physical indices into new_run_ends
-    // Keep track of the physical indices to take in take_value_indices
-    // `unwrap` is used in this function because the unwrapped values are bounded by the corresponding `::Native`.
-    let mut new_run_ends = Vec::with_capacity(1);
-    let mut take_value_indices = Vec::with_capacity(1);
-    let mut take_value_is_valid = NullBufferBuilder::new(1);
-
-    let values_cmp = make_comparator(
-        run_array.values().as_ref(),
-        run_array.values().as_ref(),
-        SortOptions::default(),
-    )?;
-
-    for ix in 1..physical_indices.len() {
-        let prev_idx = physical_indices[ix - 1];
-        let cur_idx = physical_indices[ix];
-        if is_new_run_take(run_array.values().as_ref(), prev_idx, cur_idx, &values_cmp) {
-            // Safe unwrap since physical indices came from a valid run array.
-            let index = I::Native::from_usize(prev_idx.unwrap_or_default()).unwrap();
-            take_value_indices.push(index);
-            take_value_is_valid
-                .append(prev_idx.is_some_and(|idx| run_array.values().is_valid(idx)));
-            new_run_ends.push(T::Native::from_usize(ix).unwrap());
+    let indices = logical_indices.values();
+    let nulls = logical_indices.null_count() > 0;
+    let (ascending, strictly) = match nulls {
+        false => ascending(indices),
+        true => (false, false),
+    };
+    let bounds = match ascending {
+        true => (indices.first().zip(indices.last())).map(|(a, b)| (a.as_usize(), b.as_usize())),
+        false => min_max(indices.iter().map(|i| i.as_usize())),
+    };
+    // The values behind null indices are usually in bounds, else ignore them.
+    let bounds = match bounds {
+        Some((_, last)) if nulls && last >= run_array.len() => {
+            min_max(logical_indices.iter().flatten().map(|i| i.as_usize()))
         }
+        bounds => bounds,
+    };
+    if let Some((_, last)) = bounds
+        && last >= run_array.len()
+    {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Logical index {last} is out of bounds for RunArray of length {}",
+            run_array.len()
+        )));
     }
-    let last = physical_indices[physical_indices.len() - 1];
-    // Safe unwrap since physical indices came from a valid run array.
-    let index = I::Native::from_usize(last.unwrap_or_default()).unwrap();
-    take_value_indices.push(index);
-    take_value_is_valid.append(last.is_some_and(|idx| run_array.values().is_valid(idx)));
-    new_run_ends.push(T::Native::from_usize(physical_indices.len()).unwrap());
+
+    let run_ends = run_array.run_ends();
+    let (mut new_run_ends, mut physical) = match bounds {
+        Some((first, last)) if strictly && last - first + 1 == len => {
+            contiguous_runs::<T>(run_ends, first, len)
+        }
+        Some((first, last)) if ascending && sparse_or_long_runs(run_ends, first, last, len) => {
+            gallop_runs::<T, _>(run_ends, indices)
+        }
+        Some((first, last)) if (last - first) / 8 < len => {
+            table_runs::<T, _>(run_ends, logical_indices, first, last)
+        }
+        _ => {
+            let physical = physical_indices_for_take(run_array, logical_indices)?;
+            encode_runs::<T>(physical.into_iter().map(|p| p.unwrap_or(NULL_RUN)), len)
+        }
+    };
+    let values = run_array.values();
+    merge_equal_runs(&mut new_run_ends, &mut physical, values.as_ref())?;
+    let physical = match nulls {
+        false => PrimitiveArray::<T>::new(physical.into(), None),
+        true => {
+            let null = T::Native::usize_as(NULL_RUN);
+            let valid = BooleanBuffer::collect_bool(physical.len(), |run| physical[run] != null);
+            let physical = physical
+                .iter()
+                .map(|&p| if p == null { T::Native::ZERO } else { p });
+            PrimitiveArray::new(physical.collect(), Some(NullBuffer::new(valid)))
+        }
+    };
+    let values = take(values, &physical, None)?;
 
     // SAFETY: run-ends are strictly increasing with last value == logical length.
-    let run_ends = unsafe {
-        RunEndBuffer::new_unchecked(ScalarBuffer::from(new_run_ends), 0, physical_indices.len())
+    let run_ends = unsafe { RunEndBuffer::new_unchecked(ScalarBuffer::from(new_run_ends), 0, len) };
+    // SAFETY: `values` has one entry per run.
+    Ok(unsafe { RunArray::<T>::new_unchecked(run_array.data_type().clone(), run_ends, values) })
+}
+
+/// Returns whether `f` holds for every pair of neighbouring values, checking 64 pairs at a
+/// time so that the checks vectorize.
+fn all_neighbours<V: Copy>(values: &[V], f: impl Fn(V, V) -> bool) -> bool {
+    let Some(next) = values.get(1..) else {
+        return true;
     };
+    values.chunks(64).zip(next.chunks(64)).all(|(chunk, next)| {
+        chunk
+            .iter()
+            .zip(next)
+            .fold(true, |all, (&a, &b)| all & f(a, b))
+    })
+}
 
-    let nulls = take_value_is_valid.finish();
-    let take_value_indices =
-        PrimitiveArray::<I>::new(ScalarBuffer::from(take_value_indices), nulls);
-
-    let new_values = take(run_array.values(), &take_value_indices, None)?;
-
-    // SAFETY: `new_values` has one entry per run.
-    Ok(
-        unsafe {
-            RunArray::<T>::new_unchecked(run_array.data_type().clone(), run_ends, new_values)
-        },
+/// Returns whether `indices` do not decrease, and whether they increase.
+fn ascending<N: ArrowNativeType>(indices: &[N]) -> (bool, bool) {
+    let strictly = all_neighbours(indices, |a, b| a.as_usize() < b.as_usize());
+    (
+        strictly || all_neighbours(indices, |a, b| a.as_usize() <= b.as_usize()),
+        strictly,
     )
+}
+
+/// Returns the smallest and largest index.
+fn min_max(indices: impl Iterator<Item = usize>) -> Option<(usize, usize)> {
+    let (min, max) = indices.fold((usize::MAX, 0), |(min, max), i| (min.min(i), max.max(i)));
+    (min <= max).then_some((min, max))
+}
+
+/// Returns the physical index of the run that holds logical index `index`.
+fn run_of<R: ArrowNativeType>(run_ends: &RunEndBuffer<R>, index: usize) -> usize {
+    let logical = run_ends.offset() + index;
+    run_ends
+        .values()
+        .partition_point(|end| end.as_usize() <= logical)
+}
+
+/// Returns the end of each output run and the physical index of its value for the `len`
+/// logical indices from `start`, which copies the runs that hold them.
+fn contiguous_runs<T: RunEndIndexType>(
+    run_ends: &RunEndBuffer<T::Native>,
+    start: usize,
+    len: usize,
+) -> (Vec<T::Native>, Vec<T::Native>) {
+    let first = run_of(run_ends, start);
+    let last = run_of(run_ends, start + len - 1);
+    let offset = T::Native::usize_as(run_ends.offset() + start);
+    let ends = run_ends.values()[first..=last].iter();
+    let mut ends: Vec<_> = ends.map(|&end| end.sub_wrapping(offset)).collect();
+    // The last run may end after the last index.
+    ends[last - first] = T::Native::usize_as(len);
+    (ends, (first..last + 1).map(T::Native::usize_as).collect())
+}
+
+/// Returns whether ascending indices from `first` to `last` are sparse, or take many indices
+/// per run, so that galloping over them beats a table of the runs.
+fn sparse_or_long_runs<R: ArrowNativeType>(
+    run_ends: &RunEndBuffer<R>,
+    first: usize,
+    last: usize,
+    len: usize,
+) -> bool {
+    let runs = run_of(run_ends, last) - run_of(run_ends, first) + 1;
+    (last - first) / 8 >= len || len >= 4 * runs
+}
+
+/// Returns the length of the prefix of `values` for which `pred` holds, in O(log n) steps
+/// for a prefix of length n.
+fn gallop<V: Copy>(values: &[V], pred: impl Fn(V) -> bool) -> usize {
+    let mut start = 0;
+    let mut step = 1;
+    while start + step < values.len() && pred(values[start + step]) {
+        start += step;
+        step *= 2;
+    }
+    let end = values.len().min(start + step);
+    start + values[start..end].partition_point(|&v| pred(v))
+}
+
+/// Returns the end of each output run and the physical index of its value for ascending,
+/// in-bounds, non-empty `indices`. Gallops over the indices of each run, and over the runs
+/// between indices.
+fn gallop_runs<T: RunEndIndexType, N: ArrowNativeType>(
+    run_ends: &RunEndBuffer<T::Native>,
+    indices: &[N],
+) -> (Vec<T::Native>, Vec<T::Native>) {
+    let offset = run_ends.offset();
+    let ends = run_ends.values();
+    let mut new_ends = Vec::new();
+    let mut physical = Vec::new();
+    let mut run = run_of(run_ends, indices[0].as_usize());
+    let mut i = 0;
+    while let Some(index) = indices.get(i) {
+        let logical = index.as_usize() + offset;
+        run += gallop(&ends[run..], |end| end.as_usize() <= logical);
+        let end = ends[run].as_usize() - offset;
+        i += gallop(&indices[i..], |index| index.as_usize() < end);
+        new_ends.push(T::Native::usize_as(i));
+        physical.push(T::Native::usize_as(run));
+    }
+    (new_ends, physical)
+}
+
+/// The physical index [`encode_runs`] takes for a null index.
+const NULL_RUN: usize = usize::MAX;
+
+/// Returns the end of each output run and the physical index of its value, [`NULL_RUN`] for
+/// null indices, by looking up each index in a table of the runs from `first` to `last`.
+fn table_runs<T: RunEndIndexType, I: ArrowPrimitiveType>(
+    run_ends: &RunEndBuffer<T::Native>,
+    indices: &PrimitiveArray<I>,
+    first: usize,
+    last: usize,
+) -> (Vec<T::Native>, Vec<T::Native>) {
+    let table = physical_table::<T>(run_ends, first, last + 1);
+    let lookup = |i: I::Native| table[i.as_usize() - first].as_usize();
+    match indices.null_count() {
+        0 => encode_runs::<T>(indices.values().iter().map(|&i| lookup(i)), indices.len()),
+        _ => {
+            let valid = indices.nulls().unwrap().iter();
+            // Looks up null indices too, which may be out of bounds, so that nothing branches.
+            let lookup = |(&i, valid): (&I::Native, bool)| {
+                let physical = table.get(i.as_usize().wrapping_sub(first)).copied();
+                match valid {
+                    true => physical.map_or(NULL_RUN, |p| p.as_usize()),
+                    false => NULL_RUN,
+                }
+            };
+            encode_runs::<T>(
+                indices.values().iter().zip(valid).map(lookup),
+                indices.len(),
+            )
+        }
+    }
+}
+
+/// Returns the physical index of each logical index from `start` to `end`.
+fn physical_table<T: RunEndIndexType>(
+    run_ends: &RunEndBuffer<T::Native>,
+    start: usize,
+    end: usize,
+) -> Vec<T::Native> {
+    let first = run_of(run_ends, start);
+    let runs = run_of(run_ends, end - 1) + 1 - first;
+    let ends = &run_ends.values()[first..first + runs];
+    let offset = run_ends.offset() + start;
+    let len = end - start;
+    let mut table = vec![T::Native::ZERO; len];
+    if len >= 8 * runs {
+        // Long runs: fill each run.
+        let mut from = 0;
+        for (physical, end) in (first..).zip(ends) {
+            let to = len.min(end.as_usize() - offset);
+            table[from..to].fill(T::Native::usize_as(physical));
+            from = to;
+        }
+    } else {
+        // Short runs: mark where each run starts, then sum the marks.
+        for end in &ends[..runs - 1] {
+            table[end.as_usize() - offset] = T::Native::ONE;
+        }
+        let mut physical = T::Native::usize_as(first);
+        for slot in &mut table {
+            physical = physical.add_wrapping(*slot);
+            *slot = physical;
+        }
+    }
+    table
+}
+
+/// Run-encodes the physical index of each logical index, [`NULL_RUN`] for a null index,
+/// into at most `max_runs` runs. Returns the end and physical index of each run.
+fn encode_runs<T: RunEndIndexType>(
+    mut physical: impl Iterator<Item = usize>,
+    max_runs: usize,
+) -> (Vec<T::Native>, Vec<T::Native>) {
+    let Some(first) = physical.next() else {
+        return (vec![], vec![]);
+    };
+    let mut current = T::Native::usize_as(first);
+    let mut ends = vec![T::Native::ZERO; max_runs];
+    let mut runs = vec![current; max_runs];
+    let mut run = 0;
+    let mut len = 1;
+    // Writes every index's run without branching on whether the run is new.
+    for physical in physical {
+        let physical = T::Native::usize_as(physical);
+        ends[run] = T::Native::usize_as(len);
+        run += usize::from(physical != current);
+        runs[run] = physical;
+        current = physical;
+        len += 1;
+    }
+    ends[run] = T::Native::usize_as(len);
+    ends.truncate(run + 1);
+    runs.truncate(run + 1);
+    (ends, runs)
+}
+
+/// Merges each run whose value equals the value of the run before it into that run, keeping
+/// the physical index of the last run of each merged group. Compares the values of `values`
+/// at the physical indices, so that only the merged runs are taken.
+///
+/// Two runs merge if both are null, or if both are valid and either take the same physical
+/// index or their values compare equal. A run is null if its index is null or the value at
+/// its physical index is null.
+fn merge_equal_runs<R: ArrowNativeType>(
+    run_ends: &mut Vec<R>,
+    physical: &mut Vec<R>,
+    values: &dyn Array,
+) -> Result<(), ArrowError> {
+    let cmp = make_comparator(values, values, SortOptions::default())?;
+    let nulls = values.nulls();
+    let null = R::usize_as(NULL_RUN);
+    let valid = |p: R| p != null && nulls.is_none_or(|nulls| nulls.is_valid(p.as_usize()));
+    let Some(&first) = physical.first() else {
+        return Ok(());
+    };
+    let (mut prev, mut prev_valid) = (first, valid(first));
+    let mut run = 0;
+    for i in 1..physical.len() {
+        let cur = physical[i];
+        let cur_valid = valid(cur);
+        let same = match (prev_valid, cur_valid) {
+            (false, false) => true,
+            (true, true) => prev == cur || cmp(prev.as_usize(), cur.as_usize()).is_eq(),
+            _ => false,
+        };
+        // Overwrites the run of a merged group, so that it ends with the group's last run.
+        run += usize::from(!same);
+        run_ends[run] = run_ends[i];
+        physical[run] = cur;
+        (prev, prev_valid) = (cur, cur_valid);
+    }
+    run_ends.truncate(run + 1);
+    physical.truncate(run + 1);
+    Ok(())
 }
 
 /// Physical run index for each logical take slot.
@@ -1549,25 +1796,6 @@ fn physical_indices_for_take<T: RunEndIndexType, I: ArrowPrimitiveType>(
         .iter()
         .map(|index| index.map(|_| valid_physical.next().unwrap()))
         .collect())
-}
-
-fn is_new_run_take(
-    values: &dyn Array,
-    prev_idx: Option<usize>,
-    cur_idx: Option<usize>,
-    values_cmp: &arrow_cmp::DynComparator,
-) -> bool {
-    let prev_valid = prev_idx.is_some_and(|idx| values.is_valid(idx));
-    let cur_valid = cur_idx.is_some_and(|idx| values.is_valid(idx));
-    match (prev_valid, cur_valid) {
-        (false, false) => false,
-        (true, true) => {
-            let prev = prev_idx.unwrap();
-            let cur = cur_idx.unwrap();
-            prev != cur && values_cmp(cur, prev).is_ne()
-        }
-        _ => true,
-    }
 }
 
 /// Takes/filters a fixed size list array's inner data using the offsets of the list array.
@@ -4101,6 +4329,157 @@ mod tests {
 
         let actual = result.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(actual, vec!["bob", "bob", "bob", "bob"]);
+    }
+
+    /// `take_run` as it was before it stopped sorting the indices: it finds the physical index
+    /// of each logical index, then merges neighbouring runs with the same rule, keeping the
+    /// last physical index of each merged group.
+    fn take_run_reference(
+        run_array: &RunArray<Int16Type>,
+        indices: &UInt32Array,
+    ) -> (Vec<i16>, ArrayRef) {
+        let values = run_array.values();
+        let cmp =
+            make_comparator(values.as_ref(), values.as_ref(), SortOptions::default()).unwrap();
+        let physical: Vec<_> = indices
+            .iter()
+            .map(|i| i.map(|i| run_array.get_physical_index(i as usize)))
+            .collect();
+        let valid = |p: Option<usize>| p.is_some_and(|p| values.is_valid(p));
+        let index = |p: Option<usize>| p.filter(|_| valid(p)).map(|p| p as u32);
+        let (mut ends, mut runs) = (vec![], vec![]);
+        for i in 1..physical.len() {
+            let (prev, cur) = (physical[i - 1], physical[i]);
+            let new_run = match (valid(prev), valid(cur)) {
+                (false, false) => false,
+                (true, true) => prev != cur && cmp(cur.unwrap(), prev.unwrap()).is_ne(),
+                _ => true,
+            };
+            if new_run {
+                ends.push(i as i16);
+                runs.push(index(prev));
+            }
+        }
+        if let Some(&last) = physical.last() {
+            ends.push(physical.len() as i16);
+            runs.push(index(last));
+        }
+        (ends, take(values, &UInt32Array::from(runs), None).unwrap())
+    }
+
+    #[test]
+    fn test_take_runs_matches_reference() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..1000 {
+            let mean_run_len = [1, 3, 50][rng.random_range(0..3)];
+            let mut run_ends = vec![];
+            let mut end = 0;
+            while end < 300 {
+                end += rng.random_range(1..2 * mean_run_len);
+                run_ends.push(end as i16);
+            }
+            let runs = run_ends.len();
+            // Neighbouring runs may hold equal values, and dictionaries may hold a value twice.
+            let keys: Vec<Option<i8>> = (0..runs)
+                .map(|_| rng.random_bool(0.9).then(|| rng.random_range(0..4_i8)))
+                .collect();
+            let values: ArrayRef = match rng.random_range(0..5) {
+                0 => Arc::new(
+                    keys.iter()
+                        .map(|k| k.map(i32::from))
+                        .collect::<Int32Array>(),
+                ),
+                1 => Arc::new(
+                    keys.iter()
+                        .map(|k| k.map(|k| ["a", "b", "c", "d"][k as usize]))
+                        .collect::<StringArray>(),
+                ),
+                2 => {
+                    let dictionary = StringArray::from(vec![Some("a"), Some("b"), Some("a"), None]);
+                    Arc::new(DictionaryArray::new(
+                        Int8Array::from(keys),
+                        Arc::new(dictionary),
+                    ))
+                }
+                3 => {
+                    let dictionary = StringArray::from(vec!["a", "b", "c", "d"]);
+                    Arc::new(DictionaryArray::new(
+                        Int8Array::from(keys),
+                        Arc::new(dictionary),
+                    ))
+                }
+                _ => Arc::new(NullArray::new(runs)),
+            };
+            let run_array = RunArray::try_new(&Int16Array::from(run_ends), &values).unwrap();
+            let offset = rng.random_range(0..100);
+            let len = rng.random_range(1..200);
+            let run_array = run_array.slice(offset, len);
+
+            let mut indices: Vec<_> = (0..rng.random_range(0..400))
+                .map(|_| rng.random_range(0..len as u32))
+                .collect();
+            match rng.random_range(0..4) {
+                0 => indices.sort_unstable(),
+                1 => {
+                    indices.sort_unstable();
+                    indices.dedup();
+                }
+                2 => {
+                    let start = rng.random_range(0..len as u32);
+                    indices = (start..rng.random_range(start..=len as u32)).collect();
+                }
+                _ => {}
+            }
+            // Null indices hold values that may be out of bounds.
+            let indices = match rng.random_bool(0.3) {
+                false => UInt32Array::from(indices),
+                true => {
+                    let valid: NullBuffer = indices.iter().map(|_| rng.random_bool(0.8)).collect();
+                    let indices = indices.iter().zip(valid.iter()).map(|(&i, valid)| {
+                        if valid {
+                            i
+                        } else {
+                            rng.random_range(0..2 * len as u32)
+                        }
+                    });
+                    UInt32Array::new(indices.collect(), Some(valid))
+                }
+            };
+
+            let taken = take(&run_array, &indices, None).unwrap();
+            taken.to_data().validate_full().unwrap();
+            let taken = taken.as_run::<Int16Type>();
+            let (ends, expected) = take_run_reference(&run_array, &indices);
+            assert_eq!(taken.run_ends().values(), &ends);
+            // Compares keys, not only the values they select.
+            match expected.as_dictionary_opt::<Int8Type>() {
+                Some(expected) => {
+                    assert_eq!(
+                        taken.values().as_dictionary::<Int8Type>().keys(),
+                        expected.keys()
+                    );
+                }
+                None => assert_eq!(taken.values(), &expected),
+            }
+        }
+    }
+
+    #[test]
+    fn test_take_runs_merges_before_taking_values() {
+        // Taking the values of every run before merging them would need 2,148,000,000 bytes
+        // of string data, which overflows `i32` offsets.
+        let long = "x".repeat(1_000_000);
+        let values = StringArray::from(vec![long.as_str(), "b", long.as_str()]);
+        let run_array = RunArray::try_new(&Int32Array::from(vec![1, 2, 3]), &values).unwrap();
+        let indices = UInt32Array::from_iter_values((0..2148).map(|i| 2 * (i % 2)));
+
+        let taken = take(&run_array, &indices, None).unwrap();
+        let taken = taken.as_run::<Int32Type>();
+        assert_eq!(taken.run_ends().values(), &[2148]);
+        assert_eq!(taken.values().as_string::<i32>().value(0), long);
     }
 
     #[test]
