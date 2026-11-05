@@ -1510,7 +1510,8 @@ fn take_run<T: RunEndIndexType, I: ArrowPrimitiveType>(
     // Values of fixed width merge faster after they are taken, and taking them cannot
     // overflow. Their equal runs hold identical values, so it does not matter which run of
     // a merged group gives the value.
-    let merge_taken = values.data_type().is_primitive();
+    let merge_taken = values.data_type().is_primitive()
+        || has_distinct_dictionary(values.as_ref(), physical.len())?;
     if !merge_taken {
         merge_equal_runs(&mut new_run_ends, &mut physical, values.as_ref())?;
     }
@@ -1777,7 +1778,8 @@ fn merge_equal_runs<R: ArrowNativeType>(
 }
 
 /// Merges each run whose value equals the value of the run before it into that run, given
-/// the taken value of each run. The values are primitive.
+/// the taken value of each run. The values are primitive, or a dictionary that holds no
+/// value twice.
 fn merge_equal_taken_runs<R: ArrowNativeType>(
     mut run_ends: Vec<R>,
     values: ArrayRef,
@@ -1805,7 +1807,11 @@ fn merge_equal_taken_runs<R: ArrowNativeType>(
                 &(valid ^ &valid_before.finish()) | &(valid & &differ)
             }
         },
-        _ => unreachable!("only primitive runs merge after they are taken"),
+        DataType::Dictionary(_, _) => downcast_dictionary_array! {
+            array => return merge_equal_dictionary_runs(run_ends, array),
+            _ => unreachable!(),
+        },
+        _ => unreachable!("only primitive and dictionary runs merge after they are taken"),
     };
     if starts.count_set_bits() == len {
         return Ok((run_ends, values));
@@ -1842,6 +1848,40 @@ fn merge_equal_primitive_runs<R: ArrowNativeType, P: ArrowPrimitiveType>(
     merged.truncate(run + 1);
     let merged = PrimitiveArray::<P>::new(merged.into(), None);
     Some(Arc::new(merged.with_data_type(values.data_type().clone())))
+}
+
+/// [`merge_equal_taken_runs`] for dictionary values whose dictionary holds no value twice, so
+/// that runs with different keys hold different values.
+fn merge_equal_dictionary_runs<R: ArrowNativeType, K: ArrowDictionaryKeyType>(
+    run_ends: Vec<R>,
+    values: &DictionaryArray<K>,
+) -> Result<(Vec<R>, ArrayRef), ArrowError> {
+    let (run_ends, keys) = merge_equal_taken_runs(run_ends, Arc::new(values.keys().clone()))?;
+    let keys = keys.as_primitive::<K>().clone();
+    // SAFETY: `keys` are keys of `values`, so they index its dictionary.
+    let merged = unsafe { DictionaryArray::new_unchecked(keys, values.values().clone()) };
+    Ok((run_ends, Arc::new(merged)))
+}
+
+/// Returns whether `values` is a dictionary whose dictionary holds no null and no value twice,
+/// and is small enough next to the number of `runs` to check.
+fn has_distinct_dictionary(values: &dyn Array, runs: usize) -> Result<bool, ArrowError> {
+    let Some(values) = values.as_any_dictionary_opt() else {
+        return Ok(false);
+    };
+    let dictionary = values.values();
+    // Sorting a small dictionary costs less than comparing the values of many runs.
+    Ok(dictionary.null_count() == 0
+        && dictionary.len() * 16 <= runs
+        && all_distinct(dictionary.as_ref())?)
+}
+
+/// Returns whether no two values are equal.
+fn all_distinct(values: &dyn Array) -> Result<bool, ArrowError> {
+    let cmp = make_comparator(values, values, SortOptions::default())?;
+    let mut order: Vec<_> = (0..values.len()).collect();
+    order.sort_unstable_by(|&a, &b| cmp(a, b));
+    Ok(order.windows(2).all(|pair| cmp(pair[0], pair[1]).is_ne()))
 }
 
 /// Physical run index for each logical take slot.
@@ -4558,6 +4598,39 @@ mod tests {
         let taken = taken.as_run::<Int32Type>();
         assert_eq!(taken.run_ends().values(), &[2148]);
         assert_eq!(taken.values().as_string::<i32>().value(0), long);
+    }
+
+    #[test]
+    fn test_take_runs_merges_equal_dictionary_values() {
+        // With "a" twice in the second dictionary, runs with different keys can hold equal
+        // values.
+        for dictionary in [vec!["a", "b"], vec!["a", "b", "a"]] {
+            let keys: Int32Array = (0..300).map(|i| i % dictionary.len() as i32).collect();
+            let values = DictionaryArray::new(keys, Arc::new(StringArray::from(dictionary)));
+            let run_ends = Int32Array::from_iter_values(1..=300);
+            let run_array = RunArray::try_new(&run_ends, &values).unwrap();
+
+            let a_rows: Vec<u32> = (0..300)
+                .filter(|&i| values.key(i as usize) != Some(1))
+                .collect();
+            let taken = take(&run_array, &UInt32Array::from_iter_values(a_rows), None).unwrap();
+            let taken = taken.as_run::<Int32Type>();
+            assert_eq!(taken.run_ends().values(), &[taken.len() as i32]);
+        }
+
+        // Of runs with equal values, the merged run keeps the key of the last.
+        let values = DictionaryArray::new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec!["a", "a"])),
+        );
+        let run_array = RunArray::try_new(&Int32Array::from(vec![1, 2]), &values).unwrap();
+        let taken = take(&run_array, &UInt32Array::from(vec![0, 1]), None).unwrap();
+        let taken = taken.as_run::<Int32Type>();
+        assert_eq!(taken.run_ends().values(), &[2]);
+        assert_eq!(
+            taken.values().as_dictionary::<Int32Type>().keys().values(),
+            &[1]
+        );
     }
 
     #[test]
