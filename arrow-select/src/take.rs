@@ -13,8 +13,8 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::*;
 use arrow_buffer::{
-    ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, RunEndBuffer,
-    ScalarBuffer, bit_util,
+    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, Buffer, MutableBuffer, NullBuffer,
+    OffsetBuffer, RunEndBuffer, ScalarBuffer, bit_util,
 };
 use arrow_cmp::make_comparator;
 use arrow_data::{ArrayData, transform::MutableArrayData};
@@ -1507,7 +1507,13 @@ fn take_run<T: RunEndIndexType, I: ArrowPrimitiveType>(
         }
     };
     let values = run_array.values();
-    merge_equal_runs(&mut new_run_ends, &mut physical, values.as_ref())?;
+    // Values of fixed width merge faster after they are taken, and taking them cannot
+    // overflow. Their equal runs hold identical values, so it does not matter which run of
+    // a merged group gives the value.
+    let merge_taken = values.data_type().is_primitive();
+    if !merge_taken {
+        merge_equal_runs(&mut new_run_ends, &mut physical, values.as_ref())?;
+    }
     let physical = match nulls {
         false => PrimitiveArray::<T>::new(physical.into(), None),
         true => {
@@ -1520,6 +1526,10 @@ fn take_run<T: RunEndIndexType, I: ArrowPrimitiveType>(
         }
     };
     let values = take(values, &physical, None)?;
+    let (new_run_ends, values) = match merge_taken {
+        true => merge_equal_taken_runs(new_run_ends, values)?,
+        false => (new_run_ends, values),
+    };
 
     // SAFETY: run-ends are strictly increasing with last value == logical length.
     let run_ends = unsafe { RunEndBuffer::new_unchecked(ScalarBuffer::from(new_run_ends), 0, len) };
@@ -1764,6 +1774,74 @@ fn merge_equal_runs<R: ArrowNativeType>(
     run_ends.truncate(run + 1);
     physical.truncate(run + 1);
     Ok(())
+}
+
+/// Merges each run whose value equals the value of the run before it into that run, given
+/// the taken value of each run. The values are primitive.
+fn merge_equal_taken_runs<R: ArrowNativeType>(
+    mut run_ends: Vec<R>,
+    values: ArrayRef,
+) -> Result<(Vec<R>, ArrayRef), ArrowError> {
+    let array = values.as_ref();
+    let len = array.len();
+    if len < 2 {
+        return Ok((run_ends, values));
+    }
+    let starts = downcast_primitive_array! {
+        array => match array.nulls() {
+            None => {
+                let merged = merge_equal_primitive_runs(&mut run_ends, array);
+                return Ok((run_ends, merged.unwrap_or(values)));
+            }
+            Some(nulls) => {
+                // A value starts a run if its validity differs from the value before it, or
+                // if both are valid and their values differ.
+                let valid = nulls.inner();
+                let mut valid_before = BooleanBufferBuilder::new(len);
+                valid_before.append(!valid.value(0));
+                valid_before.append_buffer(&valid.slice(0, len - 1));
+                let v = array.values();
+                let differ = BooleanBuffer::collect_bool(len, |i| i == 0 || v[i - 1].is_ne(v[i]));
+                &(valid ^ &valid_before.finish()) | &(valid & &differ)
+            }
+        },
+        _ => unreachable!("only primitive runs merge after they are taken"),
+    };
+    if starts.count_set_bits() == len {
+        return Ok((run_ends, values));
+    }
+    // A run that merges into the run before it ends that run.
+    let mut run = 0;
+    for (i, start) in starts.iter().enumerate().skip(1) {
+        run += usize::from(start);
+        run_ends[run] = run_ends[i];
+    }
+    run_ends.truncate(run + 1);
+    let values = crate::filter::filter(array, &BooleanArray::new(starts, None))?;
+    Ok((run_ends, values))
+}
+
+/// [`merge_equal_taken_runs`] for primitive values without nulls. Returns the merged values,
+/// or `None` if no runs merge.
+fn merge_equal_primitive_runs<R: ArrowNativeType, P: ArrowPrimitiveType>(
+    run_ends: &mut Vec<R>,
+    values: &PrimitiveArray<P>,
+) -> Option<ArrayRef> {
+    let v = values.values();
+    if all_neighbours(v, |a, b| a.is_ne(b)) {
+        return None;
+    }
+    let mut merged = v.to_vec();
+    let mut run = 0;
+    for i in 1..v.len() {
+        run += usize::from(v[i - 1].is_ne(v[i]));
+        run_ends[run] = run_ends[i];
+        merged[run] = v[i];
+    }
+    run_ends.truncate(run + 1);
+    merged.truncate(run + 1);
+    let merged = PrimitiveArray::<P>::new(merged.into(), None);
+    Some(Arc::new(merged.with_data_type(values.data_type().clone())))
 }
 
 /// Physical run index for each logical take slot.
