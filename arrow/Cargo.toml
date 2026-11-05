@@ -279,6 +279,11 @@ harness = false
 required-features = ["test_utils"]
 
 [[bench]]
+name = "take_run_kernels"
+harness = false
+required-features = ["test_utils"]
+
+[[bench]]
 name = "substring_kernels"
 harness = false
 required-features = ["test_utils"]
